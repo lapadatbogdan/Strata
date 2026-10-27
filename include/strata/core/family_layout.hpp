@@ -249,7 +249,11 @@ inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g
             err = "missing " + name;
             return false;
         }
-        bool same = t->shape.size() == shape.size();
+        // trailing unit dimensions are the same tensor: unsloth's Qwen3.5 / Ornith GGUFs store ffn_gate_inp_shexp as
+        // [n_embd, 1] where llama.cpp's converter writes [n_embd]
+        size_t rank = t->shape.size();
+        while (rank > shape.size() && t->shape[rank - 1] == 1) --rank;
+        bool same = rank == shape.size();
         for (size_t i = 0; same && i < shape.size(); ++i) same = t->shape[i] == (uint64_t) shape[i];
         if (!same) {
             std::string got, want;

@@ -210,6 +210,27 @@ Metrics run_product(Context & ctx, hipStream_t stream, const std::string & name,
     return m;
 }
 
+// A synthetic matrix of an i-quant that needs an importance matrix to quantize (IQ1_S, IQ2_XXS, IQ2_XS): the same
+// rows as make_q2_matrix, through ggml_quantize_chunk with a flat imatrix (any type ggml quantizes)
+std::vector<std::vector<uint8_t>> synthetic_chunk(ggml_type type, int experts, int64_t out_rows, int64_t cols, int trial) {
+    std::vector<std::vector<uint8_t>> w;
+    const std::vector<float> imatrix((size_t) cols, 1.0f);
+    for (int e = 0; e < experts; ++e) {
+        std::vector<float> m((size_t) out_rows * (size_t) cols);
+        for (int64_t r = 0; r < out_rows; ++r)
+            for (int64_t k = 0; k < cols; ++k) {
+                const int code = (int) ((k * 37 + r * 19 + e * 23 + trial * 11) % 101) - 50;
+                m[(size_t) r * (size_t) cols + (size_t) k] =
+                    0.025f * std::sin(0.013f * (float) (k + 1) + 0.17f * (float) r + 0.31f * (float) e) + 0.0015f * (float) code;
+            }
+        std::vector<uint8_t> q((size_t) out_rows * row_bytes(type, cols));
+        ggml_quantize_chunk(type, m.data(), q.data(), 0, out_rows, cols,
+                            ggml_quantize_requires_imatrix(type) ? imatrix.data() : nullptr);
+        w.push_back(std::move(q));
+    }
+    return w;
+}
+
 std::vector<std::vector<uint8_t>> synthetic_q2(int experts, int64_t out_rows, int64_t cols, int trial,
                                                ggml_type type = GGML_TYPE_Q2_0) {
     std::vector<std::vector<uint8_t>> w;
@@ -322,6 +343,22 @@ int main(int argc, char ** argv) {
                 run_product(ctx, stream, std::string("synthetic-") + name, type,
                             1280, 2560, synthetic_of_type(type, 1, 1280, 2560, 5), counts,
                             make_activations(rows, 2560, 77), src, dst);
+            }
+            // unsloth's UD-IQ2_XXS of Ornith-1.5-122B: its expert types at its shapes (gate/up 2048 x 3072, down 3072 x 1024)
+            for (const auto & [name, type] : std::initializer_list<std::pair<const char *, ggml_type>>{
+                     {"IQ1_S", GGML_TYPE_IQ1_S}, {"IQ2_XXS", GGML_TYPE_IQ2_XXS}, {"IQ2_XS", GGML_TYPE_IQ2_XS},
+                     {"IQ2_S", GGML_TYPE_IQ2_S}, {"IQ3_XXS", GGML_TYPE_IQ3_XXS}, {"Q8_0", GGML_TYPE_Q8_0}}) {
+                if (!supported((int) type)) {
+                    std::cout << "ornith-" << name << ": no MMQ instance in this build\n";
+                    ++failures;
+                    continue;
+                }
+                const std::vector<int> counts{2, 3};
+                const auto src = permutation(5, 1, false), dst = permutation(5, 2, true);
+                run_product(ctx, stream, std::string("ornith-") + name + "-GU", type, 2048, 3072,
+                            synthetic_chunk(type, 2, 2048, 3072, 7), counts, make_activations(5, 3072, 8), src, dst);
+                run_product(ctx, stream, std::string("ornith-") + name + "-down", type, 3072, 1024,
+                            synthetic_chunk(type, 2, 3072, 1024, 9), counts, make_activations(5, 1024, 10), src, dst);
             }
             // APR trellis experts (ggml types 144-146), when the build has their MMQ instances (agention fork): gate/up
             // 1280 x 2560 and down 2560 x 640 (5 blocks per row: the last 256-slice reads past the row, against zero

@@ -2123,14 +2123,26 @@ struct Engine {
             gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
             gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
-            mctx->run(gu, st);
+            // a split layer (stream_take): experts [0, split_h) from stage[0], the rest from stage[1]; the entries are sorted
+            // by expert, so each half is the same product over its experts' rows (bounds are absolute rows)
+            const int sh = lhy(li) ? split_h : 0;
+            auto run_halves = [&](MMQ::Product p, size_t off) {
+                if (!sh) { mctx->run(p, st); return; }
+                p.n = sh;
+                mctx->run(p, st);
+                p.w = stage[1] + off;
+                p.bounds = rbounds + sh;
+                p.n = ne - sh;
+                mctx->run(p, st);
+            };
+            run_halves(gu, 0);
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
             MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
             MMQ::Product dn;
             dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
-            mctx->run(dn, st);
+            run_halves(dn, L.L.down_off);
             if (lhy(li)) stream_done();
             prow = rinv;
         } else {
@@ -2254,11 +2266,18 @@ struct Engine {
 
     /// A streamed forward over the state indices `seq`: the first two layers' experts start copying now.
     void stream_begin(const std::vector<int>& seq) {
+        for (int li : seq)   // a split layer takes both buffers (stream_kick): it must be streamed on its own
+            if (seq.size() > 1 && split_layer(layer_at(li))) {
+                std::fprintf(stderr, "strata-q36: layer %d is larger than a staging buffer and not streamed alone\n", li);
+                std::exit(1);
+            }
         stream_seq = seq;
         stream_pos = 0;
         for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
     }
     uint8_t* hstage[2] = {nullptr, nullptr};   // pinned host staging of the streamed layers (pack mode)
+    size_t stage_cap = 0;                      // bytes of experts one staging buffer holds (place_experts)
+    int split_h = 0;                           // the layer just taken is split: experts [0, split_h) in stage[0], the rest in stage[1]
     size_t borrow_bytes = 0;                   // one staging buffer, when the staging is borrowed from slots
     struct Lent { int li; std::vector<int> experts; };
     std::vector<Lent> lent;                    // the layers whose slots are lent to the staging right now
@@ -2306,30 +2325,47 @@ struct Engine {
         }
         lent.clear();
     }
+    /// a layer too big for one staging buffer (an MTP block above the main layers' size): two halves, one per buffer
+    bool split_layer(const Layer& L) const { return L.stride * (size_t) m->g.n_expert > stage_cap; }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
-        const int b = i % 2;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
+        const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
+        const int ne = (int) m->g.n_expert;
+        if (split_layer(L)) {   // both buffers: a split layer is streamed alone (the MTP block's own sequence)
+            const int h = (ne + 1) / 2;
+            for (int b = 0; b < 2; ++b) {
+                CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
+                kick_range(b, L, H, b ? h : 0, b ? ne : h);
+                CK(cudaEventRecord(ev_copy[b], cst));
+            }
+            return;
+        }
+        const int b = i % 2;
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
+        kick_range(b, L, H, 0, ne);
+        CK(cudaEventRecord(ev_copy[b], cst));
+    }
+    /// experts [x0, x1) of layer L into staging buffer b from its offset 0 (expert x at (x - x0) * stride)
+    void kick_range(int b, const Layer& L, const Hy& H, int x0, int x1) {
+        const int ne = (int) m->g.n_expert;
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
         // host memory (the first version: PCIe-bound)
         static const bool all = std::getenv("STRATA_Q36_STREAM_ALL") != nullptr;
-        const int ne = (int) m->g.n_expert;
-        const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
         if (hstage[b]) {   // pack mode: the CPU gathers the non-slot experts (RAM tier or pack) into pinned memory
             CK(cudaEventSynchronize(ev_copy[b]));   // the previous DMA out of hstage[b] has finished
-            for (int x = 0; x < ne;) {
+            for (int x = x0; x < x1;) {
                 const bool dev = H.slot_of[(size_t) x] >= 0;
                 int y = x + 1;
                 if (dev)
-                    while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
+                    while (y < x1 && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
                 else
-                    while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
+                    while (y < x1 && H.slot_of[(size_t) y] < 0) ++y;
                 const size_t n = (size_t) (y - x) * L.stride;
                 if (dev) {
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) (x - x0) * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
                                        n, cudaMemcpyDeviceToDevice, cst));
                 } else {
                     // the gather runs on STRATA_Q36_GATHER_THREADS threads (default 4): one thread copies ~5-8 GB/s,
@@ -2337,42 +2373,41 @@ struct Engine {
                     static const int nth = [] { const char* e = std::getenv("STRATA_Q36_GATHER_THREADS"); return e && *e ? std::max(1, std::atoi(e)) : 4; }();
                     const int cnt = y - x;
                     auto work = [&](int t) {
-                        for (int e = x + t; e < y; e += nth) std::memcpy(hstage[b] + (size_t) e * L.stride, L.hx[(size_t) e], L.L.bytes);
+                        for (int e = x + t; e < y; e += nth) std::memcpy(hstage[b] + (size_t) (e - x0) * L.stride, L.hx[(size_t) e], L.L.bytes);
                     };
                     if (nth <= 1 || cnt < 4) {
-                        for (int e = x; e < y; ++e) std::memcpy(hstage[b] + (size_t) e * L.stride, L.hx[(size_t) e], L.L.bytes);
+                        for (int e = x; e < y; ++e) std::memcpy(hstage[b] + (size_t) (e - x0) * L.stride, L.hx[(size_t) e], L.L.bytes);
                     } else {
                         std::vector<std::thread> th;
                         for (int t = 1; t < nth; ++t) th.emplace_back(work, t);
                         work(0);
                         for (auto& h : th) h.join();
                     }
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, hstage[b] + (size_t) x * L.stride, n,
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) (x - x0) * L.stride, hstage[b] + (size_t) (x - x0) * L.stride, n,
                                        cudaMemcpyHostToDevice, cst));
                 }
                 x = y;
             }
         } else if (all || 2 * L.n_slots < ne) {
-            CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
+            CK(cudaMemcpyAsync(stage[b], L.hblobs + (size_t) x0 * L.stride, L.stride * (size_t) (x1 - x0), cudaMemcpyHostToDevice, cst));
         } else {
-            for (int x = 0; x < ne;) {
+            for (int x = x0; x < x1;) {
                 const bool dev = H.slot_of[(size_t) x] >= 0;
                 int y = x + 1;
                 if (dev)   // consecutive slots holding consecutive experts
-                    while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
+                    while (y < x1 && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
                 else
-                    while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
+                    while (y < x1 && H.slot_of[(size_t) y] < 0) ++y;
                 const size_t n = (size_t) (y - x) * L.stride;
                 if (dev)
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) (x - x0) * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
                                        n, cudaMemcpyDeviceToDevice, cst));
                 else
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.hblobs + (size_t) x * L.stride, n,
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) (x - x0) * L.stride, L.hblobs + (size_t) x * L.stride, n,
                                        cudaMemcpyHostToDevice, cst));
                 x = y;
             }
         }
-        CK(cudaEventRecord(ev_copy[b], cst));
     }
     const uint8_t* stream_take(int li) {
         if (stream_pos >= (int) stream_seq.size() || stream_seq[(size_t) stream_pos] != li) {
@@ -2380,11 +2415,22 @@ struct Engine {
             std::exit(1);
         }
         const int b = stream_pos % 2;
+        split_h = 0;
+        if (split_layer(layer_at(li))) {   // both halves (stream_kick)
+            CK(cudaStreamWaitEvent(st, ev_copy[0], 0));
+            CK(cudaStreamWaitEvent(st, ev_copy[1], 0));
+            split_h = (int) (m->g.n_expert + 1) / 2;
+            return stage[0];
+        }
         CK(cudaStreamWaitEvent(st, ev_copy[b], 0));
         return stage[b];
     }
     void stream_done() {
         const int b = stream_pos % 2;
+        if (split_h) {
+            CK(cudaEventRecord(ev_used[1 - b], st));
+            split_h = 0;
+        }
         CK(cudaEventRecord(ev_used[b], st));
         if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
         ++stream_pos;
@@ -3119,8 +3165,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer* L : all) {
         total += L->stride * (size_t) ne + kMmqTail;
         per_slot += L->stride;
-        max_layer = std::max(max_layer, L->stride * (size_t) ne);
+        if (L != &m.mtp) max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
+    // The staging buffers (a streamed prompt chunk's whole layer each) are sized for the main layers.  An MTP block
+    // larger than that (unsloth's UD files keep it at Q8_0: 2.5 GiB at Ornith-1.5-122B's FF 1024, 2.8x the largest main
+    // layer) is streamed as two halves, one per buffer (stream_kick), so it no longer doubles the pinned host staging and
+    // the borrowed VRAM.
+    if (m.has_mtp) {
+        const size_t mf = m.mtp.stride * (size_t) ne, mh = m.mtp.stride * (size_t) ((ne + 1) / 2);
+        max_layer = std::max(max_layer, mf <= max_layer ? mf : mh);
+    }
+    E.stage_cap = max_layer;
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     // STRATA_Q36_VRAM_RESERVE_MB: VRAM left free for the driver and later allocations (default 768)

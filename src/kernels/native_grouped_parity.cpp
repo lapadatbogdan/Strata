@@ -57,6 +57,7 @@ const char* name_of(int t) {
         case 22: return "IQ2_S";
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
+        case 19: return "IQ1_S";
         case 42: return "Q2_0";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
@@ -353,12 +354,19 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13,
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 19, 42, 12, 13,
 #ifdef STRATA_Q6K_EXPERTS
                    14,
 #endif
                    8})        // STRATA_GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
+    for (int dt : {16, 17, 18, 21, 22, 19}) check(16, dt, 512, 256, s, rng);   // the i-quant downs
+    check(19, 20, 512, 256, s, rng);                                    // IQ1_S gate/up
+    // unsloth's UD-IQ2_XXS of Ornith-1.5-122B (n_embd 3072, expert FF 1024): every gate/up / down pair of its layers
+    {
+        const int pairs[][2] = {{19, 19}, {19, 17}, {19, 16}, {16, 16}, {16, 22}, {16, 18}, {22, 22}, {22, 18}, {18, 18}, {18, 22}, {8, 8}};
+        for (const auto& pr : pairs) check(pr[0], pr[1], 3072, 1024, s, rng);
+    }
     check(42, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);

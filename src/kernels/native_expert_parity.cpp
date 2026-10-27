@@ -59,7 +59,8 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 namespace {
 constexpr int NT = 3, E = 7;
-constexpr int64_t H = 2560, FF = 640;
+// the expert geometry: Qwen3.5-35B / Flash-Next's 2560 x 640 unless --dims (synthetic) or the model's own tensors say otherwise
+int64_t H = 2560, FF = 640;
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
@@ -791,7 +792,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
     if (argc < 2) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
-                             "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
+                             "       native_expert_parity --synthetic [--dims N_EMBD N_FF] GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --synthetic-hadamard GU/DOWN ...   (the same, Hadamard-folded: APR)\n"
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --bf16-embd\n"
@@ -826,11 +827,17 @@ int main(int argc, char** argv) {
     } else if (mode == "--synthetic" || mode == "--synthetic-hadamard") {
         // --synthetic-hadamard: the same with the layer Hadamard-folded (APR, prism.hadamard): random signs, block 128
         const bool had = mode == "--synthetic-hadamard";
+        int first = 2;
+        if (argc > 4 && std::string(argv[2]) == "--dims") {   // --dims N_EMBD N_FF: another model's expert geometry
+            H = std::atoll(argv[3]);
+            FF = std::atoll(argv[4]);
+            first = 5;
+        }
         static std::vector<float> sx((size_t) H), sh((size_t) FF);
         std::mt19937 srng(5);
         for (auto& v : sx) v = (srng() & 1) ? 1.f : -1.f;
         for (auto& v : sh) v = (srng() & 1) ? 1.f : -1.f;
-        for (int i = 2; i < argc; ++i) {
+        for (int i = first; i < argc; ++i) {
             const std::string arg = argv[i];
             const size_t slash = arg.find('/');
             const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
@@ -866,10 +873,18 @@ int main(int argc, char** argv) {
                 if (t[r]) data[r] = model.shard(at).tensor_data(*t[r]);
             }
             if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+            H = (int64_t) t[0]->shape[0];   // the model's own expert geometry ([n_embd, n_ff, n_expert])
+            FF = (int64_t) t[0]->shape[1];
             cpu::NativeFmt f;
             std::string err;
             if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
                 std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
+            }
+            if (!strata::kernels::native_expert_supported((int) t[0]->type, (int) t[2]->type, H, FF)) {
+                std::printf("layer %d: %s/%s is not a pair the GPU expert kernels take\n", l,
+                            ggml_type_name((ggml_type) t[0]->type), ggml_type_name((ggml_type) t[2]->type));
+                ++failures;
+                continue;
             }
             std::vector<uint8_t> blob(f.bytes);
             std::memcpy(blob.data(), data[0] + (size_t) E * f.up_off, f.up_off);

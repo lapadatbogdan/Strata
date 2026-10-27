@@ -61,6 +61,7 @@ const char* name_of(int t) {
         case 22: return "IQ2_S";
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
+        case 19: return "IQ1_S";
         case 42: return "Q2_0";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
@@ -417,7 +418,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 12, 13, 7, 8}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 19, 42, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -430,6 +431,11 @@ int main(int argc, char** argv) {
     for (int gu : {12, 13})
         for (int dt : {7, 8}) check_grouped(gu, dt, 2560, 640, s, rng);
     for (int gu : {12, 13}) check_grouped(gu, 13, 2048, 512, s, rng);   // Qwen3.6-35B-A3B's geometry
+    // unsloth's UD-IQ2_XXS of Ornith-1.5-122B (n_embd 3072, expert FF 1024): every gate/up / down pair of its layers
+    {
+        const int pairs[][2] = {{19, 19}, {19, 17}, {19, 16}, {16, 16}, {16, 22}, {16, 18}, {22, 22}, {22, 18}, {18, 18}, {18, 22}, {8, 8}};
+        for (const auto& pr : pairs) check_grouped(pr[0], pr[1], 3072, 1024, s, rng);
+    }
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
