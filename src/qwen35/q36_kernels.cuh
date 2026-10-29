@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(256) k_add_rms_q(float* x, const float* y, con
 __global__ void __launch_bounds__(1024) k_moe_out_small(float* x, const float* parts, const int32_t* prow, const float* wts,
                                                         int K_, const float* shared, const float* sgate, int sg_stride,
                                                         const float* wn, float* h, int n, float eps, QB* hq = nullptr) {
-    __shared__ float vv[2048];
+    __shared__ float vv[4096];   // n <= 4096 (STRATA_Q36_MOE_OUT_4K: n_embd 3072 too; before: n <= 2048)
     __shared__ float sh[256];
     __shared__ const float* pk[16];
     const int t = blockIdx.x;
